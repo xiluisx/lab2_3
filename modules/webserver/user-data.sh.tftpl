@@ -1,0 +1,112 @@
+#!/bin/bash
+# Terraform renders this file with templatefile(), which interprets dollar-brace and
+# percent-brace sequences. Shell variables are therefore always written bare, as $VAR,
+# never braced. The two lab_label interpolations below are the only intentional ones.
+set -euxo pipefail
+
+dnf install -y nginx
+
+TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+meta() {
+  curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    "http://169.254.169.254/latest/meta-data/$1"
+}
+
+INSTANCE_ID=$(meta instance-id)
+AZ=$(meta placement/availability-zone)
+PRIVATE_IP=$(meta local-ipv4)
+INSTANCE_TYPE=$(meta instance-type)
+FQDN=$(hostname -f)
+BOOTED=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+# Derive a stable color from the instance id so each instance renders differently.
+# This is what makes load balancing legible without reading any text. Two bytes of the
+# digest are used, not one: with only a hue, two instances can land a few degrees apart
+# and look identical. The second byte varies lightness so near-hue pairs still differ.
+DIGEST=$(printf '%s' "$INSTANCE_ID" | md5sum)
+HUE=$(( 0x$(printf '%s' "$DIGEST" | cut -c1-2) * 360 / 255 ))
+BG_L=$(( 14 + 0x$(printf '%s' "$DIGEST" | cut -c3-4) * 16 / 255 ))
+CARD_L=$(( BG_L - 7 ))
+BORDER_L=$(( BG_L + 26 ))
+
+cat > /usr/share/nginx/html/index.html <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="2">
+<title>${lab_label} - $INSTANCE_ID</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: hsl($HUE 68% $BG_L%);
+    color: #fff;
+  }
+  .card {
+    width: min(680px, 100%);
+    padding: 32px;
+    border: 1px solid hsl($HUE 60% $BORDER_L%);
+    border-radius: 14px;
+    background: hsl($HUE 55% $CARD_L%);
+  }
+  .lab {
+    font-size: 13px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    opacity: .7;
+  }
+  .iid {
+    margin: 10px 0 26px;
+    font-size: clamp(22px, 5vw, 38px);
+    font-weight: 700;
+    word-break: break-all;
+  }
+  dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 10px 20px;
+    margin: 0;
+  }
+  dt { opacity: .55; }
+  dd { margin: 0; }
+  .foot { margin-top: 26px; font-size: 12px; opacity: .5; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="lab">${lab_label}</div>
+    <div class="iid">$INSTANCE_ID</div>
+    <dl>
+      <dt>Zone</dt><dd>$AZ</dd>
+      <dt>Private IP</dt><dd>$PRIVATE_IP</dd>
+      <dt>Type</dt><dd>$INSTANCE_TYPE</dd>
+      <dt>Host</dt><dd>$FQDN</dd>
+      <dt>Booted</dt><dd>$BOOTED</dd>
+    </dl>
+    <div class="foot">Reloads every 2s. Color is derived from the instance ID.</div>
+  </main>
+</body>
+</html>
+HTML
+
+printf 'ok\n' > /usr/share/nginx/html/health
+
+# Without this the browser and Cloudflare will happily serve one instance's HTML
+# forever, and the load balancing will look broken when it is not.
+cat > /etc/nginx/conf.d/lab-no-cache.conf <<'CONF'
+server_tokens off;
+add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+add_header Pragma "no-cache" always;
+CONF
+
+systemctl enable --now nginx
